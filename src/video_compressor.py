@@ -1,18 +1,19 @@
 """
 video_compressor.py – FFmpeg-based Video Compression
-Fixed pipeline: 1280×720, 30 fps, medium preset.  Only CRF varies.
+Supports H.264 and H.265 codecs with configurable CRF, resolution, and FPS.
+Includes input validation and compression speed tracking.
 """
 
 import os
+import json
 import shutil
 import subprocess
+import time
 
 
 SUPPORTED_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm"}
 
-# Fixed encoding parameters (per spec)
-RESOLUTION = "1280x720"
-FPS = 30
+# Default encoding parameters
 PRESET = "medium"
 
 
@@ -41,10 +42,70 @@ def _find_ffmpeg() -> str:
     )
 
 
-def compress_video(input_path: str, output_path: str,
-                   crf: int = 23, codec: str = "libx264") -> str:
+def _find_ffprobe() -> str:
+    """Locate ffprobe binary – mirrors ffmpeg search logic."""
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for candidate in [
+        os.path.join(project_root, "ffprobe.exe"),
+        os.path.join(project_root, "ffmpeg", "bin", "ffprobe.exe"),
+    ]:
+        if os.path.isfile(candidate):
+            return candidate
+    found = shutil.which("ffprobe")
+    if found:
+        return found
+    return ""   # ffprobe is optional; we degrade gracefully
+
+
+def validate_video(filepath: str) -> dict | None:
     """
-    Compress a video with a fixed pipeline, varying only CRF.
+    Probe a video file with ffprobe and return basic info.
+    Returns None if ffprobe is unavailable or the file is invalid.
+    """
+    ffprobe = _find_ffprobe()
+    if not ffprobe:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                ffprobe, "-v", "quiet",
+                "-print_format", "json",
+                "-show_format", "-show_streams",
+                filepath,
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            return None
+        info = json.loads(result.stdout)
+        # Extract useful metadata
+        video_stream = next(
+            (s for s in info.get("streams", []) if s.get("codec_type") == "video"),
+            None,
+        )
+        if not video_stream:
+            return None
+        return {
+            "codec": video_stream.get("codec_name"),
+            "width": int(video_stream.get("width", 0)),
+            "height": int(video_stream.get("height", 0)),
+            "duration": float(info.get("format", {}).get("duration", 0)),
+            "fps": eval(video_stream.get("r_frame_rate", "0/1")) if "/" in str(video_stream.get("r_frame_rate", "")) else float(video_stream.get("r_frame_rate", 0)),
+        }
+    except Exception:
+        return None
+
+
+def compress_video(
+    input_path: str,
+    output_path: str,
+    crf: int = 23,
+    codec: str = "libx264",
+    resolution: str | None = None,
+    fps: int | None = None,
+) -> dict:
+    """
+    Compress a video, varying CRF and optionally resolution/fps.
 
     Parameters
     ----------
@@ -52,29 +113,57 @@ def compress_video(input_path: str, output_path: str,
     output_path : path for compressed output (.mp4)
     crf         : Constant Rate Factor (lower = better quality)
     codec       : 'libx264' (H.264) or 'libx265' (H.265/HEVC)
+    resolution  : e.g. '1280x720'. None = preserve original resolution
+    fps         : target framerate. None = preserve original framerate
 
     Returns
     -------
-    output_path on success
+    dict with keys: output_path, elapsed_seconds
     """
+    if not os.path.isfile(input_path):
+        raise FileNotFoundError(f"Input video not found: {input_path}")
+
     ffmpeg = _find_ffmpeg()
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+    start = time.perf_counter()
 
     cmd = [
         ffmpeg, "-y",
         "-i", input_path,
-        "-vf", f"scale={RESOLUTION}",
-        "-r", str(FPS),
+    ]
+
+    # Only add scale filter if resolution is explicitly requested
+    if resolution:
+        cmd += ["-vf", f"scale={resolution}"]
+
+    # Only change FPS if explicitly requested
+    if fps:
+        cmd += ["-r", str(fps)]
+
+    cmd += [
         "-c:v", codec,
         "-preset", PRESET,
         "-crf", str(crf),
         "-c:a", "aac", "-b:a", "128k",
-        output_path
+        output_path,
     ]
 
     result = subprocess.run(
         cmd, capture_output=True, text=True, timeout=600
     )
     if result.returncode != 0:
-        raise RuntimeError(f"FFmpeg error:\n{result.stderr[-2000:]}")
-    return output_path
+        # Provide a clear error with the last portion of stderr
+        stderr_tail = result.stderr[-2000:] if result.stderr else "No error output"
+        raise RuntimeError(
+            f"FFmpeg failed (exit code {result.returncode}) "
+            f"compressing '{os.path.basename(input_path)}' with {codec} CRF={crf}:\n"
+            f"{stderr_tail}"
+        )
+
+    elapsed = time.perf_counter() - start
+
+    return {
+        "output_path": output_path,
+        "elapsed_seconds": round(elapsed, 4),
+    }

@@ -1,6 +1,7 @@
 """
 app.py - Media Compression System Web UI
 Beautiful Streamlit-based interface for image & video compression.
+Refactored: utility functions and chart builders extracted to src/ui_helpers.py.
 """
 
 import os
@@ -8,12 +9,8 @@ import io
 import sys
 import time
 import shutil
-import zipfile
-import tempfile
 import streamlit as st
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
 from PIL import Image
 
 # Ensure project root on path
@@ -22,11 +19,28 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.image_compressor import compress_image, is_image, SUPPORTED_EXTENSIONS as IMG_EXT
 from src.video_compressor import compress_video, is_video, SUPPORTED_EXTENSIONS as VID_EXT
 from src.metrics import (
-    file_sizes, compression_ratio,
+    file_sizes, compression_ratio, compression_speed,
     compute_image_psnr, compute_image_ssim,
     compute_video_psnr, compute_video_ssim,
 )
 from src.report import generate_csv, analyze_results
+from src.ui_helpers import (
+    format_bytes, create_zip, save_upload, scan_folder, img_to_b64,
+    chart_compression_ratio_by_quality, chart_ssim_by_quality,
+    chart_ssim_vs_ratio, chart_psnr_by_quality,
+    chart_video_ratio_vs_crf, chart_video_ssim_vs_crf,
+    chart_speed_comparison,
+    build_slider_html,
+)
+
+# Neural compression (optional – requires PyTorch)
+try:
+    from src.autoencoder import (
+        TORCH_AVAILABLE, train_autoencoder, compress_with_autoencoder,
+        get_latent_size, save_model, load_model,
+    )
+except ImportError:
+    TORCH_AVAILABLE = False
 
 # ── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -52,10 +66,17 @@ html, body, [class*="st-"]:not([class*="material"]):not([data-testid="stIconMate
     font-family: 'Material Symbols Rounded', 'Material Icons' !important;
 }
 
-/* Hide Streamlit branding */
+/* Hide Streamlit branding but keep sidebar toggle visible */
 #MainMenu {visibility: hidden;}
 footer {visibility: hidden;}
-header {visibility: hidden;}
+header[data-testid="stHeader"] {
+    background: transparent !important;
+    backdrop-filter: none !important;
+}
+/* Hide the header decoration bar but keep the collapse button */
+header[data-testid="stHeader"]::after {
+    display: none;
+}
 
 /* Main container */
 .main .block-container {
@@ -268,42 +289,74 @@ header {visibility: hidden;}
     border-radius: 12px;
     overflow: hidden;
 }
+
+/* Before/After Slider */
+.ba-slider {
+    position: relative;
+    width: 100%;
+    overflow: hidden;
+    border-radius: 12px;
+    border: 1px solid rgba(124, 58, 237, 0.3);
+}
+.ba-slider img {
+    display: block;
+    width: 100%;
+    height: auto;
+}
+.ba-slider .ba-after {
+    position: absolute;
+    top: 0;
+    left: 0;
+    height: 100%;
+    overflow: hidden;
+    border-right: 3px solid #7c3aed;
+}
+.ba-slider .ba-after img {
+    display: block;
+    height: 100%;
+    width: auto;
+    max-width: none;
+}
+
+/* Savings badge */
+.savings-card {
+    background: linear-gradient(135deg, #065f46, #064e3b);
+    border-radius: 16px;
+    padding: 1.5rem 2rem;
+    border: 1px solid rgba(16, 185, 129, 0.4);
+    text-align: center;
+    margin: 1rem 0;
+}
+.savings-value {
+    font-size: 2.5rem;
+    font-weight: 800;
+    color: #34d399;
+}
+.savings-label {
+    font-size: 0.9rem;
+    color: #a7f3d0;
+    margin-top: 0.3rem;
+}
+
+/* Autoencoder badge */
+.ae-badge {
+    background: linear-gradient(135deg, #7c3aed20, #6d28d920);
+    border: 1px solid #7c3aed50;
+    border-radius: 12px;
+    padding: 0.8rem 1rem;
+    margin: 0.5rem 0;
+    font-size: 0.85rem;
+    color: #c4b5fd;
+}
 </style>
 """, unsafe_allow_html=True)
 
-# ── Helper Functions ─────────────────────────────────────────────────────────
+# ── Paths ────────────────────────────────────────────────────────────────────
+# Helper functions (format_bytes, create_zip, save_upload, scan_folder, charts)
+# are now imported from src.ui_helpers
 
 TEMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp_uploads")
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
-
-
-def save_upload(uploaded_file) -> str:
-    """Save an uploaded file to temp and return its path."""
-    os.makedirs(TEMP_DIR, exist_ok=True)
-    path = os.path.join(TEMP_DIR, uploaded_file.name)
-    with open(path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    return path
-
-
-def format_bytes(size: int) -> str:
-    """Human-readable file size."""
-    for unit in ["B", "KB", "MB", "GB"]:
-        if abs(size) < 1024.0:
-            return f"{size:.1f} {unit}"
-        size /= 1024.0
-    return f"{size:.1f} TB"
-
-
-def create_zip(file_paths: list, zip_name: str = "compressed_files.zip") -> bytes:
-    """Create a ZIP archive from a list of file paths."""
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for fp in file_paths:
-            if os.path.isfile(fp):
-                zf.write(fp, os.path.basename(fp))
-    buffer.seek(0)
-    return buffer.read()
 
 
 # ── Hero Header ──────────────────────────────────────────────────────────────
@@ -325,9 +378,9 @@ with st.sidebar:
     st.markdown("### Image Compression")
     img_formats = st.multiselect(
         "Formats",
-        ["JPEG", "WEBP"],
+        ["JPEG", "WEBP", "AVIF"],
         default=["JPEG", "WEBP"],
-        help="Select image output formats"
+        help="Select image output formats (AVIF requires Pillow 10.1+)"
     )
     img_qualities = st.multiselect(
         "Quality Levels",
@@ -352,20 +405,48 @@ with st.sidebar:
     )
 
     st.markdown("---")
+    st.markdown("### 🧠 Neural Compression")
+    if TORCH_AVAILABLE:
+        enable_autoencoder = st.checkbox(
+            "Enable Autoencoder",
+            value=False,
+            help="Train a neural network to learn compression on your images"
+        )
+        if enable_autoencoder:
+            ae_bottleneck = st.slider(
+                "Bottleneck Size",
+                min_value=2, max_value=32, value=8, step=2,
+                help="Fewer channels = more compression, lower quality"
+            )
+            ae_epochs = st.slider(
+                "Training Epochs",
+                min_value=10, max_value=200, value=50, step=10,
+                help="More epochs = better quality, longer training"
+            )
+    else:
+        enable_autoencoder = False
+        st.markdown(
+            "<div class='ae-badge'>⚠️ Install PyTorch to enable neural compression:<br>"
+            "<code>pip install torch torchvision</code></div>",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("---")
     st.markdown("### About")
     st.markdown(
         "<div style='color:#64748b; font-size:0.85rem;'>"
         "Built for offline media compression experiments. "
-        "Supports batch processing with PSNR, SSIM & compression ratio analysis."
+        "Supports traditional codecs + neural autoencoder with PSNR, SSIM analysis."
         "</div>",
         unsafe_allow_html=True,
     )
 
 # ── Main Content Tabs ────────────────────────────────────────────────────────
-tab_compress, tab_results, tab_analysis = st.tabs([
+tab_compress, tab_results, tab_analysis, tab_compare = st.tabs([
     "Compress Files",
     "Results & Metrics",
-    "Analysis & Charts"
+    "Analysis & Charts",
+    "Visual Compare",
 ])
 
 # ── TAB 1: Compress Files ────────────────────────────────────────────────────
@@ -380,21 +461,7 @@ with tab_compress:
         help="Upload individual files or point to an entire folder on your machine.",
     )
 
-    # ── Helper: scan a folder for media files ────────────────────────────────
-    def scan_folder(folder_path: str, recursive: bool = True):
-        """Walk a folder and return lists of image/video absolute paths."""
-        img_paths, vid_paths = [], []
-        all_exts = IMG_EXT | VID_EXT
-        walker = os.walk(folder_path) if recursive else [(folder_path, [], os.listdir(folder_path))]
-        for root, _dirs, files in walker:
-            for fname in files:
-                ext = os.path.splitext(fname)[1].lower()
-                full = os.path.join(root, fname)
-                if ext in IMG_EXT:
-                    img_paths.append(full)
-                elif ext in VID_EXT:
-                    vid_paths.append(full)
-        return img_paths, vid_paths
+    # scan_folder is now imported from src.ui_helpers
 
     # ── Collect files from chosen input mode ─────────────────────────────────
     # These will be populated with (display_name, source_path) tuples
@@ -426,7 +493,7 @@ with tab_compress:
             if not os.path.isdir(folder_input):
                 st.error(f"Folder not found: **{folder_input}**")
             else:
-                img_paths, vid_paths = scan_folder(folder_input, recursive=scan_recursive)
+                img_paths, vid_paths = scan_folder(folder_input, IMG_EXT, VID_EXT, recursive=scan_recursive)
                 image_entries = [(os.path.basename(p), p) for p in sorted(img_paths)]
                 video_entries = [(os.path.basename(p), p) for p in sorted(vid_paths)]
                 has_files = bool(image_entries or video_entries)
@@ -546,11 +613,11 @@ with tab_compress:
                     if folder_mode:
                         src_path = img_source
                     else:
-                        src_path = save_upload(img_source)
+                        src_path = save_upload(img_source, TEMP_DIR)
                     basename = os.path.splitext(img_name)[0]
 
                     for fmt in img_formats:
-                        ext = ".jpg" if fmt == "JPEG" else ".webp"
+                        ext = {"JPEG": ".jpg", "WEBP": ".webp", "AVIF": ".avif"}.get(fmt, ".jpg")
                         for q in sorted(img_qualities):
                             out_name = f"{basename}_q{q}{ext}"
                             out_path = os.path.join(OUTPUT_DIR, "images", fmt.lower(), out_name)
@@ -560,11 +627,13 @@ with tab_compress:
                                     f"Processing</span> **{img_name}** → {fmt} Q{q}",
                                     unsafe_allow_html=True,
                                 )
-                                compress_image(src_path, out_path, fmt=fmt, quality=q)
+                                info = compress_image(src_path, out_path, fmt=fmt, quality=q)
+                                elapsed = info["elapsed_seconds"]
                                 orig_sz, comp_sz = file_sizes(src_path, out_path)
                                 ratio = compression_ratio(src_path, out_path)
                                 psnr = compute_image_psnr(src_path, out_path)
                                 ssim_val = compute_image_ssim(src_path, out_path)
+                                speed = compression_speed(src_path, elapsed)
                                 results.append({
                                     "Filename": img_name,
                                     "Format": fmt,
@@ -574,6 +643,8 @@ with tab_compress:
                                     "Compression_Ratio": ratio,
                                     "PSNR": psnr,
                                     "SSIM": ssim_val,
+                                    "Speed_MBps": speed,
+                                    "Time_Seconds": elapsed,
                                 })
                                 compressed_files.append(out_path)
                             except Exception as e:
@@ -593,7 +664,7 @@ with tab_compress:
                     if folder_mode:
                         src_path = vid_source
                     else:
-                        src_path = save_upload(vid_source)
+                        src_path = save_upload(vid_source, TEMP_DIR)
                     basename = os.path.splitext(vid_name)[0]
 
                     for codec_choice in vid_codecs:
@@ -609,11 +680,13 @@ with tab_compress:
                                     f"Encoding</span> **{vid_name}** → {codec_label} CRF {crf}",
                                     unsafe_allow_html=True,
                                 )
-                                compress_video(src_path, out_path, crf=crf, codec=codec)
+                                info = compress_video(src_path, out_path, crf=crf, codec=codec)
+                                elapsed = info["elapsed_seconds"]
                                 orig_sz, comp_sz = file_sizes(src_path, out_path)
                                 ratio = compression_ratio(src_path, out_path)
                                 psnr = compute_video_psnr(src_path, out_path)
                                 ssim_val = compute_video_ssim(src_path, out_path)
+                                speed = compression_speed(src_path, elapsed)
                                 results.append({
                                     "Filename": vid_name,
                                     "Format": codec_label,
@@ -623,6 +696,8 @@ with tab_compress:
                                     "Compression_Ratio": ratio,
                                     "PSNR": psnr,
                                     "SSIM": ssim_val,
+                                    "Speed_MBps": speed,
+                                    "Time_Seconds": elapsed,
                                 })
                                 compressed_files.append(out_path)
                             except Exception as e:
@@ -633,12 +708,95 @@ with tab_compress:
                                 text=f"Processing… ({done}/{total_experiments})",
                             )
 
-                progress_bar.progress(1.0, text="✅ Compression complete!")
+                progress_bar.progress(1.0, text="✅ Traditional compression complete!")
                 status_text.markdown(
                     "<span class='status-badge badge-success'>Complete</span> "
-                    "All files processed successfully!",
+                    "All codec-based files processed!",
                     unsafe_allow_html=True,
                 )
+
+                # ── Autoencoder Compression (if enabled) ──────────────────
+                ae_results = []
+                if enable_autoencoder and image_entries:
+                    st.markdown("")
+                    st.markdown('<div class="section-header">🧠 Neural Autoencoder Compression</div>', unsafe_allow_html=True)
+
+                    ae_status = st.empty()
+                    ae_progress = st.progress(0, text="Training autoencoder...")
+
+                    # Collect image paths for training
+                    train_paths = []
+                    for img_name, img_source in image_entries:
+                        if folder_mode:
+                            train_paths.append(img_source)
+                        else:
+                            p = os.path.join(TEMP_DIR, img_name)
+                            if os.path.isfile(p):
+                                train_paths.append(p)
+
+                    # Train
+                    def ae_progress_cb(epoch, total, loss):
+                        ae_progress.progress(
+                            epoch / total,
+                            text=f"Training epoch {epoch}/{total} — loss: {loss:.6f}",
+                        )
+
+                    try:
+                        ae_model = train_autoencoder(
+                            train_paths,
+                            bottleneck_channels=ae_bottleneck,
+                            epochs=ae_epochs,
+                            progress_callback=ae_progress_cb,
+                        )
+                        ae_progress.progress(1.0, text="✅ Training complete!")
+
+                        # Save model
+                        model_path = os.path.join(OUTPUT_DIR, "autoencoder_model.pth")
+                        save_model(ae_model, model_path)
+
+                        # Compress each image with the autoencoder
+                        for i, (img_name, img_source) in enumerate(image_entries):
+                            if folder_mode:
+                                src_path = img_source
+                            else:
+                                src_path = os.path.join(TEMP_DIR, img_name)
+
+                            basename = os.path.splitext(img_name)[0]
+                            out_name = f"{basename}_autoencoder.png"
+                            out_path = os.path.join(OUTPUT_DIR, "images", "autoencoder", out_name)
+
+                            ae_status.markdown(
+                                f"<span class='status-badge badge-info'>Neural</span> **{img_name}** → Autoencoder (bottleneck={ae_bottleneck})",
+                                unsafe_allow_html=True,
+                            )
+
+                            compress_with_autoencoder(ae_model, src_path, out_path)
+                            orig_sz, comp_sz = file_sizes(src_path, out_path)
+                            latent_sz = get_latent_size(ae_model, src_path)
+                            psnr = compute_image_psnr(src_path, out_path)
+                            ssim_val = compute_image_ssim(src_path, out_path)
+
+                            ae_row = {
+                                "Filename": img_name,
+                                "Format": f"Autoencoder (b={ae_bottleneck})",
+                                "Quality_CRF": ae_bottleneck,
+                                "Original_Size_Bytes": orig_sz,
+                                "Compressed_Size_Bytes": latent_sz,  # true compressed size
+                                "Compression_Ratio": round(orig_sz / latent_sz, 4) if latent_sz > 0 else 0,
+                                "PSNR": psnr,
+                                "SSIM": ssim_val,
+                            }
+                            results.append(ae_row)
+                            ae_results.append(ae_row)
+                            compressed_files.append(out_path)
+
+                        ae_status.markdown(
+                            "<span class='status-badge badge-success'>Complete</span> "
+                            "Autoencoder compression finished!",
+                            unsafe_allow_html=True,
+                        )
+                    except Exception as e:
+                        st.warning(f"Autoencoder failed: {e}")
 
                 # Save results
                 if results:
@@ -648,9 +806,48 @@ with tab_compress:
                     st.session_state["csv_path"] = csv_path
                     st.session_state["compressed_files"] = compressed_files
 
+                    # Store source paths for visual comparison
+                    source_map = {}
+                    for img_name, img_source in image_entries:
+                        if folder_mode:
+                            source_map[img_name] = img_source
+                        else:
+                            source_map[img_name] = os.path.join(TEMP_DIR, img_name)
+                    st.session_state["source_map"] = source_map
+
+                    # ── Total Savings Summary ─────────────────────────────
+                    df = pd.DataFrame(results)
+                    total_original = df.groupby("Filename")["Original_Size_Bytes"].first().sum()
+                    best_per_file = df.loc[df.groupby("Filename")["Compressed_Size_Bytes"].idxmin()]
+                    total_best_compressed = best_per_file["Compressed_Size_Bytes"].sum()
+                    total_saved = total_original - total_best_compressed
+                    savings_pct = (total_saved / total_original * 100) if total_original > 0 else 0
+
+                    sc1, sc2, sc3 = st.columns(3)
+                    with sc1:
+                        st.markdown(
+                            f'<div class="savings-card">'
+                            f'<div class="savings-value">{format_bytes(total_saved)}</div>'
+                            f'<div class="savings-label">Total Space Saved (Best Config)</div></div>',
+                            unsafe_allow_html=True,
+                        )
+                    with sc2:
+                        st.markdown(
+                            f'<div class="savings-card">'
+                            f'<div class="savings-value">{savings_pct:.1f}%</div>'
+                            f'<div class="savings-label">Size Reduction</div></div>',
+                            unsafe_allow_html=True,
+                        )
+                    with sc3:
+                        st.markdown(
+                            f'<div class="savings-card">'
+                            f'<div class="savings-value">{len(results)}</div>'
+                            f'<div class="savings-label">Total Experiments Run</div></div>',
+                            unsafe_allow_html=True,
+                        )
+
                     # Summary metrics
                     st.markdown("")
-                    df = pd.DataFrame(results)
                     c1, c2, c3, c4 = st.columns(4)
                     with c1:
                         st.markdown(
@@ -706,7 +903,7 @@ with tab_compress:
                             width='stretch',
                         )
 
-                    st.success("Switch to the **Results & Metrics** or **Analysis & Charts** tab for detailed insights!")
+                    st.success("Switch to the **Results & Metrics**, **Analysis & Charts**, or **Visual Compare** tab for detailed insights!")
 
     else:
         # Empty state
@@ -802,125 +999,49 @@ with tab_analysis:
 
         st.markdown('<div class="section-header">Experimental Analysis</div>', unsafe_allow_html=True)
 
-        # Color theme for charts
-        colors = {
-            "JPEG": "#f59e0b",
-            "WEBP": "#8b5cf6",
-            "H.264": "#3b82f6",
-            "H.265": "#10b981",
-        }
-
         # ── Image Analysis ───────────────────────────────────────────
-        img_df = df[df["Format"].isin(["JPEG", "WEBP"])]
+        img_df = df[df["Format"].isin(["JPEG", "WEBP", "AVIF"])]
         if not img_df.empty:
             st.markdown("### Image Compression Comparison")
 
             chart1, chart2 = st.columns(2)
 
             with chart1:
-                fig = px.bar(
-                    img_df,
-                    x="Quality_CRF",
-                    y="Compression_Ratio",
-                    color="Format",
-                    barmode="group",
-                    color_discrete_map=colors,
-                    title="Compression Ratio by Quality Level",
-                    labels={"Quality_CRF": "Quality", "Compression_Ratio": "Compression Ratio (x)"},
-                    template="plotly_dark",
-                )
-                fig.update_layout(
-                    plot_bgcolor="rgba(0,0,0,0)",
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    font=dict(family="Inter"),
-                    title_font_size=16,
-                    legend=dict(orientation="h", y=-0.2),
-                    margin=dict(t=50, b=60),
-                )
-                st.plotly_chart(fig, width='stretch')
+                st.plotly_chart(chart_compression_ratio_by_quality(img_df), width='stretch')
 
             with chart2:
-                fig = px.line(
-                    img_df,
-                    x="Quality_CRF",
-                    y="SSIM",
-                    color="Format",
-                    markers=True,
-                    color_discrete_map=colors,
-                    title="SSIM vs Quality Level",
-                    labels={"Quality_CRF": "Quality", "SSIM": "SSIM Score"},
-                    template="plotly_dark",
-                )
-                fig.update_layout(
-                    plot_bgcolor="rgba(0,0,0,0)",
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    font=dict(family="Inter"),
-                    title_font_size=16,
-                    legend=dict(orientation="h", y=-0.2),
-                    margin=dict(t=50, b=60),
-                )
-                st.plotly_chart(fig, width='stretch')
+                st.plotly_chart(chart_ssim_by_quality(img_df), width='stretch')
 
             chart3, chart4 = st.columns(2)
 
             with chart3:
-                fig = px.scatter(
-                    img_df,
-                    x="Compression_Ratio",
-                    y="SSIM",
-                    color="Format",
-                    size="PSNR",
-                    hover_data=["Filename", "Quality_CRF", "PSNR"],
-                    color_discrete_map=colors,
-                    title="SSIM vs Compression Ratio (bubble size = PSNR)",
-                    labels={"Compression_Ratio": "Compression Ratio (x)", "SSIM": "SSIM"},
-                    template="plotly_dark",
-                )
-                fig.update_layout(
-                    plot_bgcolor="rgba(0,0,0,0)",
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    font=dict(family="Inter"),
-                    title_font_size=16,
-                    legend=dict(orientation="h", y=-0.2),
-                    margin=dict(t=50, b=60),
-                )
-                st.plotly_chart(fig, width='stretch')
+                st.plotly_chart(chart_ssim_vs_ratio(img_df), width='stretch')
 
             with chart4:
-                fig = px.bar(
-                    img_df,
-                    x="Quality_CRF",
-                    y="PSNR",
-                    color="Format",
-                    barmode="group",
-                    color_discrete_map=colors,
-                    title="PSNR by Quality Level",
-                    labels={"Quality_CRF": "Quality", "PSNR": "PSNR (dB)"},
-                    template="plotly_dark",
-                )
-                fig.update_layout(
-                    plot_bgcolor="rgba(0,0,0,0)",
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    font=dict(family="Inter"),
-                    title_font_size=16,
-                    legend=dict(orientation="h", y=-0.2),
-                    margin=dict(t=50, b=60),
-                )
-                st.plotly_chart(fig, width='stretch')
+                st.plotly_chart(chart_psnr_by_quality(img_df), width='stretch')
+
+            # Speed comparison chart (if available)
+            speed_fig = chart_speed_comparison(img_df)
+            if speed_fig:
+                st.markdown("### Compression Speed")
+                st.plotly_chart(speed_fig, width='stretch')
 
             # Head-to-head summary
             st.markdown("### Format Comparison Summary")
             summary_data = []
-            for fmt in ["JPEG", "WEBP"]:
+            for fmt in ["JPEG", "WEBP", "AVIF"]:
                 subset = img_df[img_df["Format"] == fmt]
                 if not subset.empty:
-                    summary_data.append({
+                    row_data = {
                         "Format": fmt,
                         "Avg SSIM": f"{subset['SSIM'].mean():.6f}",
                         "Avg PSNR (dB)": f"{subset['PSNR'].mean():.2f}",
                         "Avg Compression Ratio": f"{subset['Compression_Ratio'].mean():.2f}x",
                         "Best Quality (SSIM)": f"Q={int(subset.loc[subset['SSIM'].idxmax(), 'Quality_CRF'])}",
-                    })
+                    }
+                    if "Speed_MBps" in subset.columns and subset["Speed_MBps"].notna().any():
+                        row_data["Avg Speed (MB/s)"] = f"{subset['Speed_MBps'].mean():.1f}"
+                    summary_data.append(row_data)
             if summary_data:
                 st.dataframe(pd.DataFrame(summary_data), width='stretch', hide_index=True)
 
@@ -938,52 +1059,17 @@ with tab_analysis:
                     st.info("JPEG achieves equal or better compression for these images.")
 
         # ── Video Analysis ───────────────────────────────────────────
-        vid_df = df[~df["Format"].isin(["JPEG", "WEBP"])]
+        vid_df = df[~df["Format"].isin(["JPEG", "WEBP", "AVIF"])]
+        vid_df = vid_df[~vid_df["Format"].str.contains("Autoencoder", case=False, na=False)]
         if not vid_df.empty:
             st.markdown("### Video Compression Analysis")
 
             vc1, vc2 = st.columns(2)
             with vc1:
-                fig = px.line(
-                    vid_df,
-                    x="Quality_CRF",
-                    y="Compression_Ratio",
-                    color="Format",
-                    markers=True,
-                    color_discrete_map=colors,
-                    title="Compression Ratio vs CRF",
-                    labels={"Quality_CRF": "CRF", "Compression_Ratio": "Compression Ratio (x)"},
-                    template="plotly_dark",
-                )
-                fig.update_layout(
-                    plot_bgcolor="rgba(0,0,0,0)",
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    font=dict(family="Inter"),
-                    title_font_size=16,
-                    legend=dict(orientation="h", y=-0.2),
-                )
-                st.plotly_chart(fig, width='stretch')
+                st.plotly_chart(chart_video_ratio_vs_crf(vid_df), width='stretch')
 
             with vc2:
-                fig = px.line(
-                    vid_df,
-                    x="Quality_CRF",
-                    y="SSIM",
-                    color="Format",
-                    markers=True,
-                    color_discrete_map=colors,
-                    title="SSIM vs CRF",
-                    labels={"Quality_CRF": "CRF", "SSIM": "SSIM Score"},
-                    template="plotly_dark",
-                )
-                fig.update_layout(
-                    plot_bgcolor="rgba(0,0,0,0)",
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    font=dict(family="Inter"),
-                    title_font_size=16,
-                    legend=dict(orientation="h", y=-0.2),
-                )
-                st.plotly_chart(fig, width='stretch')
+                st.plotly_chart(chart_video_ssim_vs_crf(vid_df), width='stretch')
 
         # ── Recommendations ──────────────────────────────────────────
         st.markdown("### Recommendations")
@@ -994,7 +1080,8 @@ with tab_analysis:
                 <div class="metric-card" style="text-align:left;">
                 <h4 style="color:#a78bfa; margin-top:0;">Image Guidelines</h4>
                 <ul style="color:#cbd5e1; line-height:2;">
-                <li><b>WebP</b> for web delivery (better compression)</li>
+                <li><b>AVIF</b> for maximum compression efficiency</li>
+                <li><b>WebP</b> for web delivery (broad modern support)</li>
                 <li><b>JPEG</b> for email & legacy systems</li>
                 <li><b>Quality 70</b> offers the best quality-to-size balance</li>
                 <li><b>Quality 90</b> for near-lossless preservation</li>
@@ -1018,6 +1105,140 @@ with tab_analysis:
                 """,
                 unsafe_allow_html=True,
             )
+    else:
+        st.info("No results yet. Go to the **Compress Files** tab and process some files first.")
+
+# ── TAB 4: Visual Compare ────────────────────────────────────────────────────
+with tab_compare:
+    if "results" in st.session_state and st.session_state["results"]:
+        df = pd.DataFrame(st.session_state["results"])
+        source_map = st.session_state.get("source_map", {})
+        compressed_files = st.session_state.get("compressed_files", [])
+
+        # Only show image comparisons (video compare would need frame extraction)
+        img_results = df[df["Format"].isin(["JPEG", "WEBP", "AVIF"]) | df["Format"].str.contains("Autoencoder", case=False, na=False)]
+
+        if not img_results.empty and source_map:
+            st.markdown('<div class="section-header">🔍 Original vs Compressed</div>', unsafe_allow_html=True)
+
+            # File selector
+            available_files = list(img_results["Filename"].unique())
+            selected_file = st.selectbox("Select Image", available_files, key="compare_file")
+
+            if selected_file and selected_file in source_map:
+                orig_path = source_map[selected_file]
+                file_results = img_results[img_results["Filename"] == selected_file]
+
+                # Format selector for this file
+                available_formats = list(file_results["Format"].unique())
+                selected_format = st.selectbox("Select Format", available_formats, key="compare_format")
+
+                format_results = file_results[file_results["Format"] == selected_format]
+
+                if not format_results.empty:
+                    # Quality selector
+                    available_qualities = sorted(format_results["Quality_CRF"].unique())
+                    selected_quality = st.select_slider(
+                        "Quality / Bottleneck",
+                        options=available_qualities,
+                        value=available_qualities[len(available_qualities) // 2],
+                        key="compare_quality",
+                    )
+
+                    row = format_results[format_results["Quality_CRF"] == selected_quality].iloc[0]
+
+                    # Find the compressed file
+                    basename = os.path.splitext(selected_file)[0]
+                    if "Autoencoder" in selected_format:
+                        comp_name = f"{basename}_autoencoder.png"
+                        comp_dir = os.path.join(OUTPUT_DIR, "images", "autoencoder")
+                    elif selected_format == "JPEG":
+                        comp_name = f"{basename}_q{int(selected_quality)}.jpg"
+                        comp_dir = os.path.join(OUTPUT_DIR, "images", "jpeg")
+                    elif selected_format == "AVIF":
+                        comp_name = f"{basename}_q{int(selected_quality)}.avif"
+                        comp_dir = os.path.join(OUTPUT_DIR, "images", "avif")
+                    elif selected_format == "WEBP":
+                        comp_name = f"{basename}_q{int(selected_quality)}.webp"
+                        comp_dir = os.path.join(OUTPUT_DIR, "images", "webp")
+                    else:
+                        comp_name = None
+                        comp_dir = None
+
+                    comp_path = os.path.join(comp_dir, comp_name) if comp_dir and comp_name else None
+
+                    if comp_path and os.path.isfile(comp_path) and os.path.isfile(orig_path):
+                        orig_img = Image.open(orig_path)
+                        comp_img = Image.open(comp_path)
+
+                        # Metrics for this specific comparison
+                        m1, m2, m3, m4 = st.columns(4)
+                        with m1:
+                            st.markdown(
+                                f'<div class="metric-card">'
+                                f'<div class="metric-value">{row["Compression_Ratio"]:.1f}x</div>'
+                                f'<div class="metric-label">Compression</div></div>',
+                                unsafe_allow_html=True,
+                            )
+                        with m2:
+                            st.markdown(
+                                f'<div class="metric-card">'
+                                f'<div class="metric-value">{row["PSNR"]:.1f} dB</div>'
+                                f'<div class="metric-label">PSNR</div></div>',
+                                unsafe_allow_html=True,
+                            )
+                        with m3:
+                            st.markdown(
+                                f'<div class="metric-card">'
+                                f'<div class="metric-value">{row["SSIM"]:.4f}</div>'
+                                f'<div class="metric-label">SSIM</div></div>',
+                                unsafe_allow_html=True,
+                            )
+                        with m4:
+                            st.markdown(
+                                f'<div class="metric-card">'
+                                f'<div class="metric-value">{format_bytes(int(row["Compressed_Size_Bytes"]))}</div>'
+                                f'<div class="metric-label">Compressed Size</div></div>',
+                                unsafe_allow_html=True,
+                            )
+
+                        st.markdown("")
+
+                        # ── Side-by-Side Comparison ──────────────────
+                        st.markdown("#### Side-by-Side")
+                        col_orig, col_comp = st.columns(2)
+                        with col_orig:
+                            st.markdown(
+                                f"<div style='text-align:center; color:#94a3b8; font-size:0.9rem; margin-bottom:0.5rem;'>"
+                                f"<b>Original</b> — {format_bytes(int(row['Original_Size_Bytes']))}</div>",
+                                unsafe_allow_html=True,
+                            )
+                            st.image(orig_img, width="stretch")
+                        with col_comp:
+                            st.markdown(
+                                f"<div style='text-align:center; color:#94a3b8; font-size:0.9rem; margin-bottom:0.5rem;'>"
+                                f"<b>{selected_format} Q{int(selected_quality)}</b> — "
+                                f"{format_bytes(int(row['Compressed_Size_Bytes']))}</div>",
+                                unsafe_allow_html=True,
+                            )
+                            st.image(comp_img, width="stretch")
+
+                        # ── Before/After Slider ──────────────────────
+                        st.markdown("")
+                        st.markdown("#### Before / After Slider")
+                        st.markdown(
+                            "<div style='color:#64748b; font-size:0.85rem; margin-bottom:0.5rem;'>"
+                            "Drag the slider to compare original (left) vs compressed (right).</div>",
+                            unsafe_allow_html=True,
+                        )
+
+                        slider_html, display_h = build_slider_html(orig_img, comp_img)
+                        st.components.v1.html(slider_html, height=display_h + 20)
+
+                    else:
+                        st.warning("Compressed file not found. Run compression first.")
+        else:
+            st.info("No image comparison data available. Compress some images first.")
     else:
         st.info("No results yet. Go to the **Compress Files** tab and process some files first.")
 

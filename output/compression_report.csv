@@ -1,5 +1,9 @@
-Filename,Format,Quality_CRF,Original_Size_Bytes,Compressed_Size_Bytes,Compression_Ratio,PSNR,SSIM
-HD-wallpaper-mahakal-trishul-mahadev-trishul-lord-god-mahakal-thumbnail.jpg,JPEG,30,24974,10269,2.432,33.1317,0.911504
-HD-wallpaper-mahakal-trishul-mahadev-trishul-lord-god-mahakal-thumbnail.jpg,JPEG,50,24974,15257,1.6369,35.2958,0.93995
-HD-wallpaper-mahakal-trishul-mahadev-trishul-lord-god-mahakal-thumbnail.jpg,JPEG,70,24974,21138,1.1815,39.4609,0.971603
-HD-wallpaper-mahakal-trishul-mahadev-trishul-lord-god-mahakal-thumbnail.jpg,JPEG,90,24974,29878,0.8359,46.1938,0.997903
+Filename,Format,Quality_CRF,Original_Size_Bytes,Compressed_Size_Bytes,Compression_Ratio,PSNR,SSIM,Speed_MBps,Time_Seconds
+download.png,JPEG,30,845705,34504,24.5103,32.9854,0.971736,23.1761,0.0348
+download.png,JPEG,50,845705,44488,19.0097,35.2576,0.98012,32.7857,0.0246
+download.png,JPEG,70,845705,56645,14.9299,37.0053,0.987851,24.5892,0.0328
+download.png,JPEG,90,845705,106818,7.9173,40.4772,0.99501,18.8882,0.0427
+download.png,WEBP,30,845705,23704,35.6777,35.9982,0.986314,3.4393,0.2345
+download.png,WEBP,50,845705,31026,27.2579,37.8587,0.990538,4.4048,0.1831
+download.png,WEBP,70,845705,36528,23.1522,38.9934,0.991963,4.3176,0.1868
+download.png,WEBP,90,845705,67182,12.5883,41.4417,0.99624,3.6297,0.2222

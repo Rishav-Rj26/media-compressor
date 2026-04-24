@@ -7,21 +7,36 @@ import os
 import pandas as pd
 
 
+# Extended columns including speed/time metrics
+COLUMNS = [
+    "Filename", "Format", "Quality_CRF",
+    "Original_Size_Bytes", "Compressed_Size_Bytes",
+    "Compression_Ratio", "PSNR", "SSIM",
+    "Speed_MBps", "Time_Seconds",
+]
+
+# Fallback columns (without speed metrics, for backward compatibility)
+COLUMNS_LEGACY = [
+    "Filename", "Format", "Quality_CRF",
+    "Original_Size_Bytes", "Compressed_Size_Bytes",
+    "Compression_Ratio", "PSNR", "SSIM",
+]
+
+
 def generate_csv(results: list[dict], output_path: str) -> str:
     """
     Write a list of result dictionaries to a CSV file.
-
-    Expected keys per dict:
-        Filename, Format, Quality_CRF, Original_Size_Bytes,
-        Compressed_Size_Bytes, Compression_Ratio, PSNR, SSIM
+    Automatically detects whether speed/time columns are present.
 
     Returns the output path.
     """
-    columns = [
-        "Filename", "Format", "Quality_CRF",
-        "Original_Size_Bytes", "Compressed_Size_Bytes",
-        "Compression_Ratio", "PSNR", "SSIM"
-    ]
+    if not results:
+        return output_path
+
+    # Use extended columns if the data includes Speed_MBps
+    sample = results[0]
+    columns = COLUMNS if "Speed_MBps" in sample else COLUMNS_LEGACY
+
     df = pd.DataFrame(results, columns=columns)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     df.to_csv(output_path, index=False)
@@ -33,8 +48,9 @@ def analyze_results(csv_path: str) -> str:
     Read the CSV report and produce an experimental analysis string.
 
     Comparisons:
-    - JPEG vs WebP (avg SSIM, PSNR, compression ratio)
+    - JPEG vs WebP vs AVIF (avg SSIM, PSNR, compression ratio)
     - CRF values for video
+    - Speed analysis
     - Recommendations for optimal parameters
     """
     df = pd.read_csv(csv_path)
@@ -44,10 +60,11 @@ def analyze_results(csv_path: str) -> str:
     lines.append("=" * 70)
 
     # ── Image analysis ───────────────────────────────────────────────────
-    img_df = df[df["Format"].isin(["JPEG", "WEBP"])]
+    image_formats = {"JPEG", "WEBP", "AVIF"}
+    img_df = df[df["Format"].isin(image_formats)]
     if not img_df.empty:
         lines.append("\n-- IMAGE COMPRESSION ANALYSIS --\n")
-        for fmt in ["JPEG", "WEBP"]:
+        for fmt in ["JPEG", "WEBP", "AVIF"]:
             subset = img_df[img_df["Format"] == fmt]
             if subset.empty:
                 continue
@@ -55,6 +72,8 @@ def analyze_results(csv_path: str) -> str:
             lines.append(f"    Avg SSIM             : {subset['SSIM'].mean():.6f}")
             lines.append(f"    Avg PSNR (dB)        : {subset['PSNR'].mean():.2f}")
             lines.append(f"    Avg Compression Ratio: {subset['Compression_Ratio'].mean():.2f}x")
+            if "Speed_MBps" in subset.columns and subset["Speed_MBps"].notna().any():
+                lines.append(f"    Avg Speed            : {subset['Speed_MBps'].mean():.1f} MB/s")
             # Best quality setting (highest SSIM with ratio > 1.5)
             good = subset[subset["Compression_Ratio"] > 1.5]
             if not good.empty:
@@ -63,38 +82,44 @@ def analyze_results(csv_path: str) -> str:
                              f"(SSIM={best['SSIM']:.6f}, Ratio={best['Compression_Ratio']:.2f}x)")
             lines.append("")
 
-        # Head-to-head
-        jpeg_df = img_df[img_df["Format"] == "JPEG"]
-        webp_df = img_df[img_df["Format"] == "WEBP"]
-        if not jpeg_df.empty and not webp_df.empty:
-            lines.append("  HEAD-TO-HEAD (JPEG vs WebP):")
-            j_ratio = jpeg_df["Compression_Ratio"].mean()
-            w_ratio = webp_df["Compression_Ratio"].mean()
-            lines.append(f"    Avg Ratio - JPEG: {j_ratio:.2f}x  |  WebP: {w_ratio:.2f}x")
-            if w_ratio > j_ratio:
-                pct = ((w_ratio - j_ratio) / j_ratio) * 100
-                lines.append(f"    -> WebP achieves {pct:.1f}% better compression on average.")
-            else:
-                lines.append(f"    -> JPEG achieves equal or better compression.")
-            j_ssim = jpeg_df["SSIM"].mean()
-            w_ssim = webp_df["SSIM"].mean()
-            lines.append(f"    Avg SSIM - JPEG: {j_ssim:.6f}  |  WebP: {w_ssim:.6f}")
+        # Head-to-head comparisons
+        present_formats = [f for f in ["JPEG", "WEBP", "AVIF"] if not img_df[img_df["Format"] == f].empty]
+        if len(present_formats) >= 2:
+            lines.append("  HEAD-TO-HEAD COMPARISON:")
+            for fmt in present_formats:
+                sub = img_df[img_df["Format"] == fmt]
+                lines.append(
+                    f"    {fmt:>4s}: Ratio={sub['Compression_Ratio'].mean():.2f}x  "
+                    f"SSIM={sub['SSIM'].mean():.6f}  PSNR={sub['PSNR'].mean():.2f} dB"
+                )
+            # Find winner by compression ratio
+            ratios = {f: img_df[img_df["Format"] == f]["Compression_Ratio"].mean() for f in present_formats}
+            winner = max(ratios, key=ratios.get)
+            runner_up = sorted(ratios, key=ratios.get, reverse=True)[1] if len(ratios) > 1 else None
+            if runner_up:
+                pct = ((ratios[winner] - ratios[runner_up]) / ratios[runner_up]) * 100
+                lines.append(f"    -> {winner} achieves {pct:.1f}% better compression than {runner_up} on average.")
             lines.append("")
 
     # ── Video analysis ───────────────────────────────────────────────────
-    vid_df = df[~df["Format"].isin(["JPEG", "WEBP"])]
+    vid_df = df[~df["Format"].isin(image_formats)]
+    # Also exclude autoencoder rows
+    vid_df = vid_df[~vid_df["Format"].str.contains("Autoencoder", case=False, na=False)]
     if not vid_df.empty:
         lines.append("-- VIDEO COMPRESSION ANALYSIS --\n")
         for codec in vid_df["Format"].unique():
             subset = vid_df[vid_df["Format"] == codec]
             lines.append(f"  Codec: {codec}")
             for _, row in subset.iterrows():
-                lines.append(
+                line = (
                     f"    CRF {int(row['Quality_CRF']):>2}: "
                     f"Ratio={row['Compression_Ratio']:.2f}x  "
                     f"PSNR={row['PSNR']:.2f} dB  "
                     f"SSIM={row['SSIM']:.6f}"
                 )
+                if "Time_Seconds" in row and pd.notna(row.get("Time_Seconds")):
+                    line += f"  ({row['Time_Seconds']:.1f}s)"
+                lines.append(line)
             # Best CRF
             good = subset[subset["SSIM"] >= 0.85]
             if not good.empty:
@@ -105,7 +130,9 @@ def analyze_results(csv_path: str) -> str:
 
     # ── Recommendations ──────────────────────────────────────────────────
     lines.append("-- RECOMMENDATIONS --\n")
-    lines.append("  - Use WebP for web delivery - superior compression at equal quality.")
+    if not img_df[img_df["Format"] == "AVIF"].empty:
+        lines.append("  - Use AVIF for best compression efficiency (modern browsers & apps).")
+    lines.append("  - Use WebP for web delivery — superior compression at equal quality.")
     lines.append("  - Use JPEG where broad compatibility is required (email, legacy systems).")
     lines.append("  - Use H.264 (libx264) for fast encoding & wide device support.")
     lines.append("  - Use H.265 (libx265) when storage savings outweigh encoding time.")

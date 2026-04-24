@@ -1,7 +1,16 @@
-Pillow>=10.0.0
+Pillow>=10.1.0
 opencv-python>=4.8.0
 numpy>=1.24.0
 scikit-image>=0.21.0
 pandas>=2.0.0
 streamlit>=1.30.0
 plotly>=5.18.0
+pytest>=7.4.0
+
+# AVIF support (if Pillow doesn't include it natively)
+# pillow-avif-plugin>=1.4.0
+
+# Neural compression (optional – for autoencoder feature)
+# Uncomment to enable:
+# torch>=2.0.0
+# torchvision>=0.15.0
