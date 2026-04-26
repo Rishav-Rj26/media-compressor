@@ -30,6 +30,7 @@ try:
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
+    raise ImportError("PyTorch is required for the autoencoder. Install with: pip install torch torchvision")
 
 
 # ── Loss Function ────────────────────────────────────────────────────────────
